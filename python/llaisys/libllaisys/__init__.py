@@ -12,6 +12,8 @@ from .llaisys_types import llaisysStream_t
 from .tensor import llaisysTensor_t
 from .tensor import load_tensor
 from .ops import load_ops
+from .qwen2 import load_qwen2
+from .qwen2 import LlaisysQwen2Meta, LlaisysQwen2Weights, LlaisysQwen2Model_t
 
 
 def load_shared_library():
@@ -31,6 +33,9 @@ def load_shared_library():
     if not os.path.isfile(lib_path):
         raise FileNotFoundError(f"Shared library not found: {lib_path}")
 
+    lib_path_abs = os.path.abspath(lib_path)
+    if os.environ.get("LLAISYS_DEBUG"):
+        print(f"[LLAISYS] Loading shared library: {lib_path_abs}")
     return ctypes.CDLL(str(lib_path))
 
 
@@ -38,6 +43,7 @@ LIB_LLAISYS = load_shared_library()
 load_runtime(LIB_LLAISYS)
 load_tensor(LIB_LLAISYS)
 load_ops(LIB_LLAISYS)
+load_qwen2(LIB_LLAISYS)
 
 
 __all__ = [
@@ -52,4 +58,7 @@ __all__ = [
     "llaisysMemcpyKind_t",
     "MemcpyKind",
     "llaisysStream_t",
+    "LlaisysQwen2Meta",
+    "LlaisysQwen2Weights",
+    "LlaisysQwen2Model_t",
 ]

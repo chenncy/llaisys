@@ -105,18 +105,20 @@ target("llaisys")
 
     set_languages("cxx17")
     set_warnings("all", "error")
+    add_includedirs("src")
     add_files("src/llaisys/*.cc")
     set_installdir(".")
 
     
     after_install(function (target)
-        -- copy shared library to python package
+        -- copy shared library to python package (xmake installs shared libs to lib/ when installdir is ".")
+        local pkgdir = path.join(os.scriptdir(), "python", "llaisys", "libllaisys")
         print("Copying llaisys to python/llaisys/libllaisys/ ..")
         if is_plat("windows") then
-            os.cp("bin/*.dll", "python/llaisys/libllaisys/")
+            os.cp("lib/*.dll", pkgdir)
         end
         if is_plat("linux") then
-            os.cp("lib/*.so", "python/llaisys/libllaisys/")
+            os.cp("lib/*.so", pkgdir)
         end
     end)
 target_end()
