@@ -76,10 +76,11 @@ class Qwen2:
         max_position = config.get("max_position_embeddings", 131072)
         maxseq = min(4096, max_position)
 
-        torch_dtype = config.get("torch_dtype", "bfloat16")
-        if isinstance(torch_dtype, str) and "bfloat" in torch_dtype.lower():
+        # Prefer "dtype" (new), fallback to "torch_dtype"
+        cfg_dtype = config.get("dtype", config.get("torch_dtype", "bfloat16"))
+        if isinstance(cfg_dtype, str) and "bfloat" in cfg_dtype.lower():
             dtype = DataType.BF16
-        elif isinstance(torch_dtype, str) and "float16" in torch_dtype.lower():
+        elif isinstance(cfg_dtype, str) and "float16" in cfg_dtype.lower():
             dtype = DataType.F16
         else:
             dtype = DataType.BF16
@@ -117,9 +118,9 @@ class Qwen2:
         key_to_handle = dict(_weight_key_to_handle(weights_ptr, num_hidden_layers))
         loaded_keys = set()
 
-        # NumPy 不原生支持 bfloat16，safetensors 用 numpy 加载 bf16 会报错，改用 PyTorch 加载后转成 numpy
-        use_pt = dtype == DataType.BF16
-        if use_pt and torch is None:
+        # NumPy 不原生支持 bfloat16，safetensors 用 numpy 加载 bf16 会报错，必须用 PyTorch 打开后转成 numpy
+        use_pt = (dtype == DataType.BF16) or (torch is not None)
+        if dtype == DataType.BF16 and torch is None:
             raise RuntimeError("Loading bfloat16 weights requires PyTorch (pip install torch)")
         for fpath in sorted(model_path.glob("*.safetensors")):
             with safetensors.safe_open(

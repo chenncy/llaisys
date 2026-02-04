@@ -190,7 +190,7 @@ void forward_layer(LlaisysQwen2Model *m, size_t layer_idx,
                    size_t seq_len, size_t cache_start,
                    tensor_t pos_ids_t) {
     const LlaisysQwen2Meta *meta = &m->meta;
-    const size_t hs = meta->hs, nh = meta->nh, nkvh = meta->nkvh, dh = meta->dh, di = meta->di;
+    const size_t hs = meta->hs, nh = meta->nh, nkvh = meta->nkvh, dh = meta->dh;
     const float eps = meta->epsilon, theta = meta->theta;
     LlaisysQwen2Weights *w = &m->weights;
     tensor_t wt = get_t(w->attn_norm_w[layer_idx]);
