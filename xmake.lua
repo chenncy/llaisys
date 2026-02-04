@@ -109,16 +109,13 @@ target("llaisys")
     add_files("src/llaisys/*.cc")
     set_installdir(".")
 
-    
+    -- 将构建出的动态库复制到 Python 包目录，供 pip install 打包；CI 下 xmake install 后 pip 才能找到 .dll/.so
     after_install(function (target)
-        -- copy shared library to python package (xmake installs shared libs to lib/ when installdir is ".")
         local pkgdir = path.join(os.scriptdir(), "python", "llaisys", "libllaisys")
-        print("Copying llaisys to python/llaisys/libllaisys/ ..")
-        if is_plat("windows") then
-            os.cp("lib/*.dll", pkgdir)
-        end
-        if is_plat("linux") then
-            os.cp("lib/*.so", pkgdir)
+        local built = target:targetfile()
+        if os.isfile(built) then
+            print("Copying " .. built .. " to python/llaisys/libllaisys/ ..")
+            os.cp(built, pkgdir)
         end
     end)
 target_end()
