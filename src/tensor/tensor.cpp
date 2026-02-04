@@ -7,7 +7,7 @@
 #include <sstream>
 
 namespace llaisys {
-
+//这是一个注释,这是tensor的构造函数,用于初始化tensor的元数据,存储和偏移量
 Tensor::Tensor(TensorMeta meta, core::storage_t storage, size_t offset)
     : _meta(std::move(meta)), _storage(std::move(storage)), _offset(offset) {}
 
