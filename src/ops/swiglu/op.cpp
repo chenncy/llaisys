@@ -3,7 +3,14 @@
 #include "../../core/llaisys_core.hpp"
 #include "../../utils.hpp"
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #include <cmath>
+#ifdef ENABLE_NVIDIA_API
+#include "llaisys/ops_nvidia.h"
+#endif
 
 namespace {
 
@@ -18,6 +25,9 @@ inline float silu(float x) {
 
 template <typename T>
 void swiglu_impl(T *out, const T *gate, const T *up, size_t n) {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
     for (size_t i = 0; i < n; i++) {
         float g, u;
         if constexpr (std::is_same_v<T, llaisys::bf16_t> || std::is_same_v<T, llaisys::fp16_t>) {
@@ -74,7 +84,7 @@ void swiglu(tensor_t out, tensor_t gate, tensor_t up) {
         return swiglu_cpu(out->data(), gate->data(), up->data(), out->dtype(), n);
 #ifdef ENABLE_NVIDIA_API
     case LLAISYS_DEVICE_NVIDIA:
-        TO_BE_IMPLEMENTED();
+        nvidia::swiglu(out->data(), gate->data(), up->data(), out->dtype(), n);
         return;
 #endif
     default:

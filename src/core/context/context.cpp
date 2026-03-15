@@ -53,6 +53,12 @@ void Context::setDevice(llaisysDeviceType_t device_type, int device_id) {
     // If doest not match the current runtime.
     if (_current_runtime == nullptr || _current_runtime->deviceType() != device_type || _current_runtime->deviceId() != device_id) {
         auto runtimes = _runtime_map[device_type];
+        if (runtimes.empty()) {
+            if (device_type == LLAISYS_DEVICE_NVIDIA)
+                CHECK_ARGUMENT(false, "no NVIDIA GPUs available (get_device_count() returned 0). Use --device cpu or check CUDA/driver.");
+            else
+                CHECK_ARGUMENT(false, "no devices available for this device type (get_device_count() returned 0).");
+        }
         CHECK_ARGUMENT((size_t)device_id < runtimes.size() && device_id >= 0, "invalid device id");
         if (_current_runtime != nullptr) {
             _current_runtime->_deactivate();

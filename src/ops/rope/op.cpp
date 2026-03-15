@@ -3,8 +3,15 @@
 #include "../../core/llaisys_core.hpp"
 #include "../../utils.hpp"
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #include <cmath>
 #include <vector>
+#ifdef ENABLE_NVIDIA_API
+#include "llaisys/ops_nvidia.h"
+#endif
 
 namespace {
 
@@ -19,6 +26,9 @@ void rope_impl(T *out, const T *in, const int64_t *pos_ids, size_t seq_len, size
         double exp = 2.0 * static_cast<double>(j) / static_cast<double>(head_dim);
         inv_freq[j] = 1.0 / std::pow(static_cast<double>(theta), exp);
     }
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
     for (size_t s = 0; s < seq_len; s++) {
         double p = static_cast<double>(pos_ids[s]);
         for (size_t h = 0; h < n_head; h++) {
@@ -96,7 +106,7 @@ void rope(tensor_t out, tensor_t in, tensor_t pos_ids, float theta) {
                         theta);
 #ifdef ENABLE_NVIDIA_API
     case LLAISYS_DEVICE_NVIDIA:
-        TO_BE_IMPLEMENTED();
+        nvidia::rope(out->data(), in->data(), reinterpret_cast<const int64_t *>(pos_ids->data()), out->dtype(), seq_len, n_head, head_dim, theta);
         return;
 #endif
     default:

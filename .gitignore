@@ -25,6 +25,9 @@ __pycache__/
 # Cache
 cache/
 
+# 本地模型目录（体积大，勿提交）
+DeepSeek-R1-Distill-Qwen-1___5B/
+
 # JSON
 *.json
 

@@ -33,6 +33,13 @@ def load_shared_library():
     if not os.path.isfile(lib_path):
         raise FileNotFoundError(f"Shared library not found: {lib_path}")
 
+    # 预加载 OpenMP 运行时，避免 libllaisys.so 出现 undefined symbol: omp_get_thread_num
+    if sys.platform.startswith("linux"):
+        try:
+            ctypes.CDLL("libgomp.so.1", mode=ctypes.RTLD_GLOBAL)
+        except OSError:
+            pass  # 若系统无 libgomp 或已链接进 .so，忽略
+
     lib_path_abs = os.path.abspath(lib_path)
     if os.environ.get("LLAISYS_DEBUG"):
         print(f"[LLAISYS] Loading shared library: {lib_path_abs}")

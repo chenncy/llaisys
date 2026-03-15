@@ -4,6 +4,9 @@
 #include "../../utils.hpp"
 
 #include <cstring>
+#ifdef ENABLE_NVIDIA_API
+#include "llaisys/ops_nvidia.h"
+#endif
 
 namespace {
 
@@ -52,7 +55,7 @@ void embedding(tensor_t out, tensor_t index, tensor_t weight) {
         return embedding_cpu(out->data(), weight->data(), reinterpret_cast<const int64_t *>(index->data()), num_index, embed_dim, vocab_size, out->elementSize());
 #ifdef ENABLE_NVIDIA_API
     case LLAISYS_DEVICE_NVIDIA:
-        TO_BE_IMPLEMENTED();
+        nvidia::embedding(out->data(), weight->data(), reinterpret_cast<const int64_t *>(index->data()), num_index, embed_dim, vocab_size, out->elementSize());
         return;
 #endif
     default:

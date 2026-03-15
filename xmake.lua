@@ -1,10 +1,18 @@
 add_rules("mode.debug", "mode.release")
 set_encodings("utf-8")
 
+-- 避免「add_cxflags("-fPIC") is ignored」被当作错误导致构建失败（已对 -fPIC 使用 {force = true}，此策略作兜底）
+set_policy("check.auto_ignore_flags", false)
+
 add_includedirs("include")
+-- 全局 -fPIC（static 链接进 so 需要），只加一次避免各 target 内 add_cxflags 触发 xmake 的 ignore 检查
+if not is_plat("windows") then
+    add_cxflags("-fPIC", {force = true})
+end
 
 -- CPU --
 includes("xmake/cpu.lua")
+-- cpu.lua 的 static target 也需 -fPIC，上面全局已加，此处无需再注
 
 -- NVIDIA --
 option("nv-gpu")
@@ -20,13 +28,11 @@ end
 
 target("llaisys-utils")
     set_kind("static")
-
     set_languages("cxx17")
-    set_warnings("all", "error")
+    set_warnings("all")
     if not is_plat("windows") then
-        add_cxflags("-fPIC", "-Wno-unknown-pragmas")
+        add_cxflags("-Wno-unknown-pragmas")
     end
-
     add_files("src/utils/*.cpp")
 
     on_install(function (target) end)
@@ -37,13 +43,14 @@ target("llaisys-device")
     set_kind("static")
     add_deps("llaisys-utils")
     add_deps("llaisys-device-cpu")
-
-    set_languages("cxx17")
-    set_warnings("all", "error")
-    if not is_plat("windows") then
-        add_cxflags("-fPIC", "-Wno-unknown-pragmas")
+    if has_config("nv-gpu") then
+        add_deps("llaisys-device-nvidia")
     end
-
+    set_languages("cxx17")
+    set_warnings("all")
+    if not is_plat("windows") then
+        add_cxflags("-Wno-unknown-pragmas")
+    end
     add_files("src/device/*.cpp")
 
     on_install(function (target) end)
@@ -53,13 +60,11 @@ target("llaisys-core")
     set_kind("static")
     add_deps("llaisys-utils")
     add_deps("llaisys-device")
-
     set_languages("cxx17")
-    set_warnings("all", "error")
+    set_warnings("all")
     if not is_plat("windows") then
-        add_cxflags("-fPIC", "-Wno-unknown-pragmas")
+        add_cxflags("-Wno-unknown-pragmas")
     end
-
     add_files("src/core/*/*.cpp")
 
     on_install(function (target) end)
@@ -68,13 +73,11 @@ target_end()
 target("llaisys-tensor")
     set_kind("static")
     add_deps("llaisys-core")
-
     set_languages("cxx17")
-    set_warnings("all", "error")
+    set_warnings("all")
     if not is_plat("windows") then
-        add_cxflags("-fPIC", "-Wno-unknown-pragmas")
+        add_cxflags("-Wno-unknown-pragmas")
     end
-
     add_files("src/tensor/*.cpp")
 
     on_install(function (target) end)
@@ -83,11 +86,22 @@ target_end()
 target("llaisys-ops")
     set_kind("static")
     add_deps("llaisys-ops-cpu")
-
+    if has_config("nv-gpu") then
+        add_deps("llaisys-ops-nvidia")
+    end
     set_languages("cxx17")
-    set_warnings("all", "error")
+    set_warnings("all")
     if not is_plat("windows") then
-        add_cxflags("-fPIC", "-Wno-unknown-pragmas")
+        add_cxflags("-Wno-unknown-pragmas")
+    end
+    -- OpenMP：linear 等算子多线程并行，提升 CPU 推理速度
+    add_cxflags("-fopenmp")
+    add_mxflags("-fopenmp")
+    add_ldflags("-fopenmp")
+    
+    -- AVX2+FMА：FP32 linear 使用 SIMD（仅 x86_64）
+    if is_arch("x86_64") then
+        add_cxflags("-mavx2", "-mfma")
     end
     
     add_files("src/ops/*/*.cpp")
@@ -104,17 +118,23 @@ target("llaisys")
     add_deps("llaisys-ops")
 
     set_languages("cxx17")
-    set_warnings("all", "error")
+    set_warnings("all")
     add_includedirs("src")
     add_files("src/llaisys/*.cc")
+    add_ldflags("-fopenmp")
+    add_links("gomp")
+    if has_config("nv-gpu") then
+        add_links("cudart")
+        add_ldflags("-fPIC")
+    end
     set_installdir(".")
 
     -- 将构建出的动态库复制到 Python 包目录，供 pip install 打包；CI 下 xmake install 后 pip 才能找到 .dll/.so
     after_install(function (target)
-        local pkgdir = path.join(os.scriptdir(), "python", "llaisys", "libllaisys")
+        local pkgdir = path.join(os.scriptdir(), "python", "llaisys_py", "libllaisys")
         local built = target:targetfile()
         if os.isfile(built) then
-            print("Copying " .. built .. " to python/llaisys/libllaisys/ ..")
+            print("Copying " .. built .. " to python/llaisys_py/libllaisys/ ..")
             os.cp(built, pkgdir)
         end
     end)

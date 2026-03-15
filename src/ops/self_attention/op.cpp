@@ -3,9 +3,16 @@
 #include "../../core/llaisys_core.hpp"
 #include "../../utils.hpp"
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #include <cmath>
 #include <vector>
 #include <limits>
+#ifdef ENABLE_NVIDIA_API
+#include "llaisys/ops_nvidia.h"
+#endif
 
 namespace {
 
@@ -14,10 +21,17 @@ template <typename T>
 void self_attention_impl(float *attn_val, const T *q, const T *k, const T *v, float scale,
                         size_t qlen, size_t kvlen, size_t nh, size_t nkvh, size_t hd) {
     const ptrdiff_t causal_off = static_cast<ptrdiff_t>(kvlen) - static_cast<ptrdiff_t>(qlen);
-    std::vector<float> scores(static_cast<size_t>(kvlen));
     const float neg_inf = -std::numeric_limits<float>::infinity();
 
-    for (size_t i = 0; i < qlen; i++) {
+#ifdef _OPENMP
+#pragma omp parallel
+#endif
+    {
+        std::vector<float> scores(static_cast<size_t>(kvlen));
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+        for (size_t i = 0; i < qlen; i++) {
         for (size_t h = 0; h < nh; h++) {
             const size_t kv_h = h * nkvh / nh;
             const T *q_row = q + i * nh * hd + h * hd;
@@ -64,6 +78,7 @@ void self_attention_impl(float *attn_val, const T *q, const T *k, const T *v, fl
                 out_row[d] = sum_v;
             }
         }
+        }
     }
 }
 
@@ -77,6 +92,9 @@ void self_attention_cpu_typed(std::byte *attn_val, const std::byte *q, const std
     self_attention_impl(out_f.data(), q_t, k_t, v_t, scale, qlen, kvlen, nh, nkvh, hd);
     T *out_t = reinterpret_cast<T *>(attn_val);
     const size_t total = qlen * nh * hd;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
     for (size_t idx = 0; idx < total; idx++)
         out_t[idx] = llaisys::utils::cast<T>(out_f[idx]);
 }
@@ -127,8 +145,8 @@ void self_attention(tensor_t attn_val, tensor_t q, tensor_t k, tensor_t v, float
                                    scale, qlen, kvlen, nh, nkvh, hd);
 #ifdef ENABLE_NVIDIA_API
     case LLAISYS_DEVICE_NVIDIA:
-        TO_BE_IMPLEMENTED();
-        return;
+        nvidia::self_attention(attn_val->data(), q->data(), k->data(), v->data(), attn_val->dtype(), qlen, kvlen, nh, nkvh, hd, scale);
+        break;
 #endif
     default:
         EXCEPTION_UNSUPPORTED_DEVICE;

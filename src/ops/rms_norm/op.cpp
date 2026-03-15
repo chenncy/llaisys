@@ -3,7 +3,14 @@
 #include "../../core/llaisys_core.hpp"
 #include "../../utils.hpp"
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #include <cmath>
+#ifdef ENABLE_NVIDIA_API
+#include "llaisys/ops_nvidia.h"
+#endif
 
 namespace {
 
@@ -11,6 +18,9 @@ namespace {
 template <typename T>
 void rms_norm_impl(T *out, const T *in, const T *weight, size_t rows, size_t d, float eps) {
     const float inv_d = 1.0f / static_cast<float>(d);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
     for (size_t i = 0; i < rows; i++) {
         const T *row_in = in + i * d;
         T *row_out = out + i * d;
@@ -83,7 +93,7 @@ void rms_norm(tensor_t out, tensor_t in, tensor_t weight, float eps) {
         return rms_norm_cpu(out->data(), in->data(), weight->data(), out->dtype(), rows, d, eps);
 #ifdef ENABLE_NVIDIA_API
     case LLAISYS_DEVICE_NVIDIA:
-        TO_BE_IMPLEMENTED();
+        nvidia::rms_norm(out->data(), in->data(), weight->data(), out->dtype(), rows, d, eps);
         return;
 #endif
     default:
