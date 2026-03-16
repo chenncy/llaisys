@@ -26,6 +26,34 @@ if has_config("nv-gpu") then
     includes("xmake/nvidia.lua")
 end
 
+-- 项目#5：NCCL 张量并行（多 GPU 推理）。需先启用 nv-gpu，并安装 libnccl（如 apt install libnccl2 libnccl-dev 或 conda install nccl）
+option("nccl")
+    set_default(false)
+    set_showmenu(true)
+    set_description("Enable NCCL for tensor-parallel distributed inference (Project #5)")
+option_end()
+
+if has_config("nccl") and has_config("nv-gpu") then
+target("llaisys-nccl")
+    set_kind("static")
+    add_deps("llaisys-device-nvidia")
+    set_languages("cxx17")
+    set_warnings("all")
+    add_includedirs("include", "src")
+    add_defines("ENABLE_NCCL", "ENABLE_NVIDIA_API")
+    if not is_plat("windows") then
+        add_cuflags("-Xcompiler=-fPIC")
+        add_culdflags("-Xcompiler=-fPIC", {force = true})
+    end
+    add_files("src/llaisys/nccl_comm.cu")
+    add_links("nccl")
+    add_cugencodes("native")
+    add_cugencodes("compute_60")
+    add_values("cuda.build.devlink", true)
+    on_install(function (target) end)
+target_end()
+end
+
 target("llaisys-utils")
     set_kind("static")
     set_languages("cxx17")
@@ -124,7 +152,14 @@ target("llaisys")
     set_languages("cxx17")
     set_warnings("all")
     add_includedirs("src")
-    add_files("src/llaisys/*.cc")
+    if has_config("nccl") and has_config("nv-gpu") then
+        add_deps("llaisys-nccl")
+        add_defines("ENABLE_NCCL")
+        add_files("src/llaisys/*.cc|nccl_comm_stub.cc")
+        add_links("nccl")
+    else
+        add_files("src/llaisys/*.cc")
+    end
     -- OpenMP：Windows 用 MSVC /openmp（无需 gomp.lib），Linux/macOS 用 -fopenmp + gomp
     if is_plat("windows") then
         add_cxflags("/openmp")

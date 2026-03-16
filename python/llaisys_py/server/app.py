@@ -12,7 +12,7 @@ import queue
 import threading
 import uuid
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Callable, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse, HTMLResponse
@@ -727,9 +727,17 @@ _SESSIONS_HTML = """<!DOCTYPE html>
     const sendBtn = document.getElementById('sendBtn');
     const statusEl = document.getElementById('status');
     let currentSessionId = null;
+    let currentAbortController = null;
     const MAX_TOKENS = 256;
 
     function setStatus(msg) { statusEl.textContent = msg || ''; }
+
+    function abortCurrentStream() {
+      if (currentAbortController) {
+        currentAbortController.abort();
+        currentAbortController = null;
+      }
+    }
 
     async function api(path, opts) {
       const r = await fetch(path, opts);
@@ -757,7 +765,15 @@ _SESSIONS_HTML = """<!DOCTYPE html>
       return d.innerHTML;
     }
 
+    let streamPollTimer = null;
+    let streamPollLastContent = '';
+    let streamPollUnchangedCount = 0;
+
     async function switchSession(sessionId) {
+      if (streamPollTimer) {
+        clearInterval(streamPollTimer);
+        streamPollTimer = null;
+      }
       currentSessionId = sessionId;
       await loadSessions();
       const s = await api('/v1/sessions/' + sessionId);
@@ -766,6 +782,31 @@ _SESSIONS_HTML = """<!DOCTYPE html>
       chatArea.style.display = 'flex';
       inputRow.style.display = 'flex';
       renderMessages(s.messages || []);
+      if ((s.messages || []).length > 0) {
+        streamPollLastContent = JSON.stringify(s.messages);
+        streamPollUnchangedCount = 0;
+        streamPollTimer = setInterval(pollSessionStream, 500);
+      }
+    }
+
+    async function pollSessionStream() {
+      if (!currentSessionId) return;
+      try {
+        const s = await api('/v1/sessions/' + currentSessionId);
+        const msgs = s.messages || [];
+        const snapshot = JSON.stringify(msgs);
+        if (snapshot !== streamPollLastContent) {
+          streamPollLastContent = snapshot;
+          streamPollUnchangedCount = 0;
+          renderMessages(msgs);
+          chatArea.scrollTop = chatArea.scrollHeight;
+        } else {
+          streamPollUnchangedCount++;
+          if (streamPollUnchangedCount >= 4) {
+            if (streamPollTimer) { clearInterval(streamPollTimer); streamPollTimer = null; }
+          }
+        }
+      } catch (_) {}
     }
 
     function renderMessages(messages) {
@@ -811,6 +852,10 @@ _SESSIONS_HTML = """<!DOCTYPE html>
 
     async function regenerateFrom(userMsgIndex, newContent) {
       if (!currentSessionId) return;
+      if (streamPollTimer) { clearInterval(streamPollTimer); streamPollTimer = null; }
+      if (currentAbortController) currentAbortController.abort();
+      currentAbortController = new AbortController();
+      const streamSessionId = currentSessionId;
       setStatus('正在重新生成…');
       sendBtn.disabled = true;
       try {
@@ -822,7 +867,8 @@ _SESSIONS_HTML = """<!DOCTYPE html>
             new_content: newContent || undefined,
             max_tokens: MAX_TOKENS,
             stream: true
-          })
+          }),
+          signal: currentAbortController.signal
         });
         if (!r.ok) throw new Error(await r.text());
         const reader = r.body.getReader();
@@ -847,25 +893,32 @@ _SESSIONS_HTML = """<!DOCTYPE html>
               const data = JSON.parse(payload);
               if (data && data.__error) {
                 fullContent = data.__error || '请求失败';
-                bubble.textContent = fullContent;
+                if (currentSessionId === streamSessionId) bubble.textContent = fullContent;
                 break;
               }
               const delta = data.choices?.[0]?.delta?.content;
-              if (delta) { fullContent += delta; bubble.textContent = fullContent; chatArea.scrollTop = chatArea.scrollHeight; }
+              if (delta) {
+                fullContent += delta;
+                if (currentSessionId === streamSessionId) {
+                  bubble.textContent = fullContent;
+                  chatArea.scrollTop = chatArea.scrollHeight;
+                }
+              }
             } catch (_) {}
           }
           if (done) break;
         }
-        if (!fullContent) bubble.textContent = '(无回复)';
+        if (currentSessionId === streamSessionId && !fullContent) bubble.textContent = '(无回复)';
+        if (currentSessionId === streamSessionId) {
+          const s = await api('/v1/sessions/' + streamSessionId);
+          renderMessages(s.messages || []);
+        }
       } catch (e) {
-        setStatus('错误: ' + e.message);
+        if (e.name !== 'AbortError' && currentSessionId === streamSessionId) setStatus('错误: ' + e.message);
       }
+      currentAbortController = null;
       setStatus('');
       sendBtn.disabled = false;
-      if (currentSessionId) {
-        const s = await api('/v1/sessions/' + currentSessionId);
-        renderMessages(s.messages || []);
-      }
     }
 
     async function deleteSession(sessionId) {
@@ -890,10 +943,18 @@ _SESSIONS_HTML = """<!DOCTYPE html>
     async function send() {
       const text = userInput.value.trim();
       if (!text || !currentSessionId) return;
+      if (streamPollTimer) {
+        clearInterval(streamPollTimer);
+        streamPollTimer = null;
+      }
+      if (currentAbortController) currentAbortController.abort();
+      currentAbortController = new AbortController();
+      const streamSessionId = currentSessionId;
       userInput.value = '';
       sendBtn.disabled = true;
       setStatus('正在生成…');
       const s = await api('/v1/sessions/' + currentSessionId);
+      if (currentSessionId !== streamSessionId) { setStatus(''); sendBtn.disabled = false; currentAbortController = null; return; }
       const messages = (s.messages || []).concat([{ role: 'user', content: text }]);
       const bubbleWrap = document.createElement('div');
       bubbleWrap.className = 'msg user';
@@ -910,11 +971,12 @@ _SESSIONS_HTML = """<!DOCTYPE html>
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            session_id: currentSessionId,
+            session_id: streamSessionId,
             messages: messages,
             max_tokens: MAX_TOKENS,
             stream: true
-          })
+          }),
+          signal: currentAbortController.signal
         });
         if (!r.ok) throw new Error(await r.text());
         const reader = r.body.getReader();
@@ -932,20 +994,31 @@ _SESSIONS_HTML = """<!DOCTYPE html>
             try {
               const data = JSON.parse(payload);
               if (data && data.__error) {
-                bubble.textContent = data.__error || '请求失败';
+                if (currentSessionId === streamSessionId) bubble.textContent = data.__error || '请求失败';
                 break;
               }
               const delta = data.choices?.[0]?.delta?.content;
-              if (delta) { bubble.textContent = (bubble.textContent || '') + delta; chatArea.scrollTop = chatArea.scrollHeight; }
+              if (delta !== undefined && currentSessionId === streamSessionId) {
+                if (delta === '') {
+                  if (!bubble.textContent || bubble.textContent === '排队中…') bubble.textContent = '排队中…';
+                } else {
+                  if (bubble.textContent === '排队中…') bubble.textContent = delta;
+                  else bubble.textContent = (bubble.textContent || '') + delta;
+                  chatArea.scrollTop = chatArea.scrollHeight;
+                }
+              }
             } catch (_) {}
           }
           if (done) break;
         }
-        if (!bubble.textContent.trim()) bubble.textContent = '(无回复)';
+        if (currentSessionId === streamSessionId && !bubble.textContent.trim()) bubble.textContent = '(无回复)';
       } catch (e) {
-        setStatus('错误: ' + e.message);
-        bubble.textContent = bubble.textContent || '(请求失败)';
+        if (e.name !== 'AbortError') {
+          setStatus('错误: ' + e.message);
+          if (currentSessionId === streamSessionId) bubble.textContent = bubble.textContent || '(请求失败)';
+        }
       }
+      currentAbortController = null;
       setStatus('');
       sendBtn.disabled = false;
     }
@@ -988,9 +1061,9 @@ class ChatCompletionRequest(BaseModel):
     messages: list[ChatMessage] = Field(..., description="多轮对话历史，最后一条一般为 user")
     session_id: Optional[str] = Field(default=None, description="可选；若提供，完成后将本轮 user+assistant 追加到该会话")
     max_tokens: int = Field(default=512, ge=1, le=2048, description="本次最多生成的新 token 数")
-    temperature: float = Field(default=0.5, ge=0.0, le=2.0, description="默认 0.5 更聚焦；答非所问时可试 0.3")
+    temperature: float = Field(default=0.3, ge=0.0, le=2.0, description="默认 0.3 减少胡言乱语；若回复太死板可试 0.5")
     top_p: float = Field(default=0.9, ge=0.0, le=1.0)
-    top_k: int = Field(default=50, ge=0, le=100)
+    top_k: int = Field(default=40, ge=0, le=100)
     stream: bool = Field(default=False, description="是否以 SSE 流式返回")
     seed: Optional[int] = Field(default=None, description="随机种子；None 表示非确定性")
 
@@ -1085,8 +1158,8 @@ class RegenerateRequest(BaseModel):
     from_message_index: int = Field(..., ge=0, description="保留到该条用户消息（含），之后全部删除并重新生成")
     new_content: Optional[str] = Field(default=None, description="若提供，替换该条用户消息内容")
     max_tokens: int = Field(default=512, ge=1, le=2048)
-    temperature: float = Field(default=0.5, ge=0.0, le=2.0)
-    top_k: int = Field(default=50, ge=0, le=100)
+    temperature: float = Field(default=0.3, ge=0.0, le=2.0)
+    top_k: int = Field(default=40, ge=0, le=100)
     top_p: float = Field(default=0.9, ge=0.0, le=1.0)
     stream: bool = Field(default=True)
     seed: Optional[int] = Field(default=None)
@@ -1108,8 +1181,8 @@ _DEGENERATE_FALLBACK = "（回复异常，请重试。）"
 
 def _is_degenerate_output(full_content: list[str], last_token_ids: list[int], max_recent: int = 20) -> bool:
     """
-    检测是否陷入退化输出（如重复的 "1\\n0\\n0\\n" 或 "12\\n13\\n14\\n"）。
-    若最近内容仅包含数字、换行、空格且有一定长度，则视为退化并建议停止。
+    检测是否陷入退化输出（如重复的 "1\\n0\\n0\\n"、纯数字、或同一词/ token 大量重复）。
+    若最近内容仅包含数字/换行/空格且有一定长度，或同一词在最近片段中出现过多，则视为退化并建议停止。
     """
     if len(full_content) < 5:
         return False
@@ -1118,6 +1191,13 @@ def _is_degenerate_output(full_content: list[str], last_token_ids: list[int], ma
         return True
     allowed = set(" \n\t\r0123456789")
     if not all(c in allowed for c in recent_text):
+        # 非纯数字：检查是否同一词重复过多（如 "regards regards regards"）
+        words = recent_text.split()
+        if len(words) >= 5:
+            from collections import Counter
+            cnt = Counter(words)
+            if cnt and cnt.most_common(1)[0][1] >= 4:
+                return True
         return False
     # 纯数字/换行且长度>=4 即视为退化（如 "1\\n0\\n" 或 "12\\n13"）
     if len(recent_text.strip()) >= 4:
@@ -1492,6 +1572,7 @@ def _register_routes(app: FastAPI):
         while True:
             item = _request_queue.get()
             resp_queue = item["response_queue"]
+            cancel_event = item.get("cancel_event")
             try:
                 with _inference_lock:
                     tokenizer = _get_tokenizer()
@@ -1512,12 +1593,38 @@ def _register_routes(app: FastAPI):
                     if kv_blob is not None and prefix_len > 0:
                         model.import_kv_cache(kv_blob, prefix_len)
                     if stream:
+                        if session_id:
+                            with _sessions_lock:
+                                s = _sessions.get(session_id)
+                                if s is not None:
+                                    s["messages"] = [{"role": m.role, "content": m.content} for m in messages]
+                                    s["messages"].append({"role": "assistant", "content": ""})
+                                    s["updated_at"] = _now_iso()
+                        cancel_check = (lambda: cancel_event.is_set()) if cancel_event else None
                         for chunk in _stream_chunks_generator(
                             model, tokenizer, input_ids, item["max_tokens"],
                             item["temperature"], item["top_k"], item["top_p"], seed,
                             prompt=prompt, session_id=session_id, request_messages=messages, prefix_len=prefix_len,
+                            cancel_check=cancel_check,
                         ):
+                            if cancel_event and cancel_event.is_set():
+                                break
                             resp_queue.put(chunk)
+                            if session_id and isinstance(chunk, str) and chunk.startswith("data: "):
+                                try:
+                                    payload = chunk[6:].strip().strip("\n")
+                                    if payload and payload != "[DONE]":
+                                        data = json.loads(payload)
+                                        delta = (data.get("choices") or [{}])[0].get("delta") or {}
+                                        delta_content = delta.get("content")
+                                        if isinstance(delta_content, str) and delta_content:
+                                            with _sessions_lock:
+                                                s = _sessions.get(session_id)
+                                                if s and s["messages"] and s["messages"][-1]["role"] == "assistant":
+                                                    s["messages"][-1]["content"] += delta_content
+                                                    s["updated_at"] = _now_iso()
+                                except (json.JSONDecodeError, IndexError, KeyError, TypeError):
+                                    pass
                         resp_queue.put(_STREAM_SENTINEL)
                     else:
                         full_tokens = model.generate(
@@ -1656,9 +1763,11 @@ def _register_routes(app: FastAPI):
 
         # ---------- 原有 worker 路径 ----------
         response_queue = queue.Queue()
+        cancel_event = threading.Event()
         try:
             _request_queue.put_nowait({
                 "response_queue": response_queue,
+                "cancel_event": cancel_event,
                 "session_id": req.session_id,
                 "messages": req.messages,
                 "stream": req.stream,
@@ -1671,16 +1780,23 @@ def _register_routes(app: FastAPI):
         except queue.Full:
             raise HTTPException(status_code=503, detail="Request queue full, try again later")
         if req.stream:
+            response_queue.put("data: " + json.dumps(
+                {"choices": [{"index": 0, "delta": {"content": ""}, "finish_reason": None}]},
+                ensure_ascii=False,
+            ) + "\n\n")
             def stream_from_queue():
-                while True:
-                    chunk = response_queue.get()
-                    if chunk is _STREAM_SENTINEL:
-                        return
-                    if isinstance(chunk, dict):
-                        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-                        yield "data: [DONE]\n\n"
-                        return
-                    yield chunk
+                try:
+                    while True:
+                        chunk = response_queue.get()
+                        if chunk is _STREAM_SENTINEL:
+                            return
+                        if isinstance(chunk, dict):
+                            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                            yield "data: [DONE]\n\n"
+                            return
+                        yield chunk
+                finally:
+                    cancel_event.set()
             return StreamingResponse(
                 stream_from_queue(),
                 media_type="text/event-stream",
@@ -1697,9 +1813,11 @@ def _register_routes(app: FastAPI):
         session_id: Optional[str] = None,
         request_messages: Optional[list[ChatMessage]] = None,
         prefix_len: int = 0,
+        cancel_check: Optional[Callable[[], bool]] = None,
     ):
         """
         流式生成 SSE 块；供 _stream_response 与 worker 共用。yield 若干 "data: {...}\\n\\n" 字符串。
+        cancel_check: 若提供且返回 True 则提前结束生成（用于客户端断开时取消推理）。
         """
         import sys
         _chat_debug = os.environ.get("LLAISYS_CHAT_DEBUG", "").strip() in ("1", "true", "yes")
@@ -1726,6 +1844,8 @@ def _register_routes(app: FastAPI):
                     print(f"[CHAT_DEBUG] input_ids[:15]={input_ids[:15]} ... input_ids[-5:]={input_ids[-5:]}", file=sys.stderr)
             if prefix_len == 0:
                 model.reset_kv_cache()
+            # 每次采样使用不同 seed，避免 C 层每步用同一 seed 重设 RNG 导致重复采样同一 token（如出现 "0" 后立刻退化）
+            sampling_step = 0
             if prefix_len > 0 and prefix_len < len(input_ids):
                 suffix = input_ids[prefix_len:]
                 next_id = model.next_token(
@@ -1733,8 +1853,9 @@ def _register_routes(app: FastAPI):
                     temperature=temperature,
                     top_k=top_k,
                     top_p=top_p,
-                    seed=seed,
+                    seed=seed + sampling_step,
                 )
+                sampling_step += 1
                 tokens.append(next_id)
                 recent_token_ids.append(next_id)
                 if _chat_debug:
@@ -1751,6 +1872,8 @@ def _register_routes(app: FastAPI):
                 n_remaining = max_tokens - 1
             step = 0
             for _ in range(n_remaining):
+                if cancel_check and cancel_check():
+                    break
                 if next_id == model.end_token:
                     break
                 # 首步且 prefix_len==0 时必须传入完整 prompt 做 prefill，否则只传最后一个 token 做 decode
@@ -1760,7 +1883,7 @@ def _register_routes(app: FastAPI):
                         temperature=temperature,
                         top_k=top_k,
                         top_p=top_p,
-                        seed=seed,
+                        seed=seed + sampling_step,
                     )
                 else:
                     next_id = model.next_token(
@@ -1768,8 +1891,9 @@ def _register_routes(app: FastAPI):
                         temperature=temperature,
                         top_k=top_k,
                         top_p=top_p,
-                        seed=seed,
+                        seed=seed + sampling_step,
                     )
+                sampling_step += 1
                 tokens.append(next_id)
                 recent_token_ids.append(next_id)
                 if len(recent_token_ids) > 30:
@@ -1780,11 +1904,21 @@ def _register_routes(app: FastAPI):
                     print(f"[CHAT_DEBUG] step={step} token_id={next_id} end={next_id == model.end_token} delta={repr(dt)}", file=sys.stderr)
                 if next_id == model.end_token:
                     break
+                # 尽早检测：同一 token 连续或多次重复则视为退化，不输出当前 token 直接停
+                if len(recent_token_ids) >= 2 and next_id == recent_token_ids[-2]:
+                    stopped_degenerate = True
+                    break
+                if len(recent_token_ids) >= 5:
+                    from collections import Counter
+                    cnt = Counter(recent_token_ids[-6:])
+                    if cnt and cnt.most_common(1)[0][1] >= 3:
+                        stopped_degenerate = True
+                        break
                 delta_text = tokenizer.decode([next_id], skip_special_tokens=True)
                 if not delta_text:
                     continue
                 full_content.append(delta_text)
-                # 退化输出检测：连续多为数字/换行时提前停止，避免无限循环
+                # 退化输出检测：同一词重复、纯数字/换行等
                 if _is_degenerate_output(full_content, recent_token_ids):
                     if _chat_debug:
                         print(f"[CHAT_DEBUG] stop: degenerate output detected", file=sys.stderr)
@@ -1798,14 +1932,16 @@ def _register_routes(app: FastAPI):
             if _chat_debug:
                 full_text = "".join(full_content)
                 print(f"[CHAT_DEBUG] done steps={step} full_text_len={len(full_text)} full_text={repr(full_text[:500])}", file=sys.stderr)
-            # 若因退化停止且内容仅为数字/换行，补发友好提示并以此作为会话内容
-            if stopped_degenerate and _is_content_only_digits_and_whitespace(full_content):
-                fallback_chunk = {
-                    "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
-                    "choices": [{"index": 0, "delta": {"content": _DEGENERATE_FALLBACK}, "finish_reason": None}],
-                }
-                yield f"data: {json.dumps(fallback_chunk, ensure_ascii=False)}\n\n"
-                full_content = [_DEGENERATE_FALLBACK]
+            # 若因退化停止：仅当整段内容纯数字/空白等明显垃圾时才用 fallback 替换；否则保留已生成内容，只停止续写
+            if stopped_degenerate:
+                if _is_content_only_digits_and_whitespace(full_content):
+                    fallback_chunk = {
+                        "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+                        "choices": [{"index": 0, "delta": {"content": _DEGENERATE_FALLBACK}, "finish_reason": None}],
+                    }
+                    yield f"data: {json.dumps(fallback_chunk, ensure_ascii=False)}\n\n"
+                    full_content = [_DEGENERATE_FALLBACK]
+                # 否则 full_content 保持不变，会话保存已生成的部分内容
             chunk = {
                 "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
                 "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],

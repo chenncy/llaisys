@@ -8,6 +8,12 @@
 # 必须在 import 任何会间接加载 torch/CUDA 的模块之前执行（如 create_app -> transformers -> torch）。
 import os
 import sys
+# 发生 segfault 时打印 Python 栈，便于定位是否在 C 扩展内崩溃
+try:
+    import faulthandler
+    faulthandler.enable(all_threads=True)
+except Exception:
+    pass
 if os.environ.get("CUDA_VISIBLE_DEVICES") == "":
     os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 

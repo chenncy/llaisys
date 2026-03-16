@@ -14,6 +14,7 @@ from .tensor import load_tensor
 from .ops import load_ops
 from .qwen2 import load_qwen2
 from .qwen2 import LlaisysQwen2Meta, LlaisysQwen2Weights, LlaisysQwen2Model_t
+from . import nccl_comm
 
 
 def load_shared_library():
@@ -51,7 +52,7 @@ load_runtime(LIB_LLAISYS)
 load_tensor(LIB_LLAISYS)
 load_ops(LIB_LLAISYS)
 load_qwen2(LIB_LLAISYS)
-
+nccl_comm.load_nccl(LIB_LLAISYS)
 
 __all__ = [
     "LIB_LLAISYS",

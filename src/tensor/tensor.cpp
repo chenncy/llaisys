@@ -49,15 +49,17 @@
      size_t total_elems = stride; 
      size_t dtype_size = utils::dsize(dtype); // 算出一个元素占几个字节
  
-     // 【大白话】：根据要求的设备（CPU 或 GPU），去盖一个真正能装下这么多字节的物理仓库（Storage）
-     if (device_type == LLAISYS_DEVICE_CPU && core::context().runtime().deviceType() != LLAISYS_DEVICE_CPU) {
-         auto storage = core::context().runtime().allocateHostStorage(total_elems * dtype_size);
-         return std::shared_ptr<Tensor>(new Tensor(meta, storage));
-     } else {
-         core::context().setDevice(device_type, device);
-         auto storage = core::context().runtime().allocateDeviceStorage(total_elems * dtype_size);
-         return std::shared_ptr<Tensor>(new Tensor(meta, storage));
+     // 确保当前线程已激活设备，避免 context().runtime() 在未 setDevice 时断言失败
+     if (device_type == LLAISYS_DEVICE_CPU) {
+         core::context().setDevice(LLAISYS_DEVICE_CPU, 0);
+         if (core::context().runtime().deviceType() != LLAISYS_DEVICE_CPU) {
+             auto storage = core::context().runtime().allocateHostStorage(total_elems * dtype_size);
+             return std::shared_ptr<Tensor>(new Tensor(meta, storage));
+         }
      }
+     core::context().setDevice(device_type, device);
+     auto storage = core::context().runtime().allocateDeviceStorage(total_elems * dtype_size);
+     return std::shared_ptr<Tensor>(new Tensor(meta, storage));
  }
  
  // 【大白话】：去仓库拿货。注意必须加上 _offset！

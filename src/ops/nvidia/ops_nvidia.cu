@@ -18,7 +18,12 @@ __device__ __forceinline__ float bf16_to_float(uint16_t v) {
     return __uint_as_float(u);
 }
 __device__ __forceinline__ uint16_t float_to_bf16(float x) {
-    return (uint16_t)(__float_as_uint(x) >> 16);
+    uint32_t u = __float_as_uint(x);
+    uint32_t bf16_bits = u >> 16;
+    uint32_t remainder = u & 0xFFFFu;
+    if (remainder > 0x8000u) bf16_bits++;
+    else if (remainder == 0x8000u && (bf16_bits & 1u)) bf16_bits++;
+    return (uint16_t)bf16_bits;
 }
 __device__ __forceinline__ float half_to_float(uint16_t v) {
     uint32_t sign = (v & 0x8000u) << 16;
@@ -46,13 +51,20 @@ __global__ void add_kernel(T* c, const T* a, const T* b, size_t n) {
     if (i < n) c[i] = a[i] + b[i];
 }
 
-template<>
-__global__ void add_kernel<uint16_t>(uint16_t* c, const uint16_t* a, const uint16_t* b, size_t n) {
+__global__ void add_kernel_bf16(uint16_t* c, const uint16_t* a, const uint16_t* b, size_t n) {
     size_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     float fa = bf16_to_float(a[i]);
     float fb = bf16_to_float(b[i]);
     c[i] = float_to_bf16(fa + fb);
+}
+
+__global__ void add_kernel_f16(uint16_t* c, const uint16_t* a, const uint16_t* b, size_t n) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float fa = half_to_float(a[i]);
+    float fb = half_to_float(b[i]);
+    c[i] = float_to_half(fa + fb);
 }
 
 void add(std::byte* c, const std::byte* a, const std::byte* b, llaisysDataType_t dtype, size_t numel) {
@@ -62,9 +74,11 @@ void add(std::byte* c, const std::byte* a, const std::byte* b, llaisysDataType_t
     case LLAISYS_DTYPE_F32:
         add_kernel<float><<<grid, block>>>((float*)c, (const float*)a, (const float*)b, numel);
         break;
-    case LLAISYS_DTYPE_F16:
     case LLAISYS_DTYPE_BF16:
-        add_kernel<uint16_t><<<grid, block>>>((uint16_t*)c, (const uint16_t*)a, (const uint16_t*)b, numel);
+        add_kernel_bf16<<<grid, block>>>((uint16_t*)c, (const uint16_t*)a, (const uint16_t*)b, numel);
+        break;
+    case LLAISYS_DTYPE_F16:
+        add_kernel_f16<<<grid, block>>>((uint16_t*)c, (const uint16_t*)a, (const uint16_t*)b, numel);
         break;
     default:
         break;
@@ -72,72 +86,86 @@ void add(std::byte* c, const std::byte* a, const std::byte* b, llaisysDataType_t
 }
 
 // ---- Embedding (gather rows) ----
-__global__ void embedding_kernel_f32(float* out, const float* weight, const int64_t* index, size_t num_index, size_t embed_dim) {
+__global__ void embedding_kernel_f32(float* out, const float* weight, const int64_t* index, size_t num_index, size_t embed_dim, size_t vocab_size) {
     size_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= num_index * embed_dim) return;
     size_t row = i / embed_dim;
     size_t col = i % embed_dim;
     int64_t idx = index[row];
+    if (idx < 0 || (size_t)idx >= vocab_size) { out[i] = 0.f; return; }
     out[i] = weight[(size_t)idx * embed_dim + col];
 }
 
-__global__ void embedding_kernel_bf16(uint16_t* out, const uint16_t* weight, const int64_t* index, size_t num_index, size_t embed_dim) {
+__global__ void embedding_kernel_bf16(uint16_t* out, const uint16_t* weight, const int64_t* index, size_t num_index, size_t embed_dim, size_t vocab_size) {
     size_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= num_index * embed_dim) return;
     size_t row = i / embed_dim;
     size_t col = i % embed_dim;
     int64_t idx = index[row];
+    if (idx < 0 || (size_t)idx >= vocab_size) { out[i] = 0; return; }
     out[i] = weight[(size_t)idx * embed_dim + col];
 }
 
-void embedding(std::byte* out, const std::byte* weight, const int64_t* index, size_t num_index, size_t embed_dim, size_t /*vocab_size*/, size_t elem_size) {
+void embedding(std::byte* out, const std::byte* weight, const int64_t* index, size_t num_index, size_t embed_dim, size_t vocab_size, size_t elem_size) {
     size_t n = num_index * embed_dim;
     size_t block = 256;
     size_t grid = (n + block - 1) / block;
     if (elem_size == 4)
-        embedding_kernel_f32<<<grid, block>>>((float*)out, (const float*)weight, index, num_index, embed_dim);
+        embedding_kernel_f32<<<grid, block>>>((float*)out, (const float*)weight, index, num_index, embed_dim, vocab_size);
     else
-        embedding_kernel_bf16<<<grid, block>>>((uint16_t*)out, (const uint16_t*)weight, index, num_index, embed_dim);
+        embedding_kernel_bf16<<<grid, block>>>((uint16_t*)out, (const uint16_t*)weight, index, num_index, embed_dim, vocab_size);
 }
 
 // ---- Linear: out(B,M) = in(B,K) * weight(M,K)^T + bias ----
+// 使用 2D grid (gridM, gridB)，避免大 1D grid 在部分环境下的问题；i=blockIdx.y, j=blockIdx.x*blockDim.x+threadIdx.x
 __global__ void linear_kernel_f32(float* out, const float* in, const float* weight, const float* bias, size_t B, size_t M, size_t K) {
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    size_t total = B * M;
-    if (idx >= total) return;
-    size_t i = idx / M;
-    size_t j = idx % M;
+    size_t i = (size_t)blockIdx.y;
+    size_t j = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= B || j >= M) return;
     float sum = 0.f;
     for (size_t k = 0; k < K; k++)
         sum += in[i * K + k] * weight[j * K + k];
     if (bias) sum += bias[j];
-    out[idx] = sum;
+    out[i * M + j] = sum;
 }
 
 __global__ void linear_kernel_bf16(uint16_t* out, const uint16_t* in, const uint16_t* weight, const uint16_t* bias, size_t B, size_t M, size_t K) {
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    size_t total = B * M;
-    if (idx >= total) return;
-    size_t i = idx / M;
-    size_t j = idx % M;
+    size_t i = (size_t)blockIdx.y;
+    size_t j = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= B || j >= M) return;
     float sum = 0.f;
     for (size_t k = 0; k < K; k++)
         sum += bf16_to_float(in[i * K + k]) * bf16_to_float(weight[j * K + k]);
     if (bias) sum += bf16_to_float(bias[j]);
-    out[idx] = float_to_bf16(sum);
+    out[i * M + j] = float_to_bf16(sum);
+}
+
+__global__ void linear_kernel_f16(uint16_t* out, const uint16_t* in, const uint16_t* weight, const uint16_t* bias, size_t B, size_t M, size_t K) {
+    size_t i = (size_t)blockIdx.y;
+    size_t j = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= B || j >= M) return;
+    float sum = 0.f;
+    for (size_t k = 0; k < K; k++)
+        sum += half_to_float(in[i * K + k]) * half_to_float(weight[j * K + k]);
+    if (bias) sum += half_to_float(bias[j]);
+    out[i * M + j] = float_to_half(sum);
 }
 
 void linear(std::byte* out, const std::byte* in, const std::byte* weight, const std::byte* bias, llaisysDataType_t dtype, size_t B, size_t M, size_t K) {
-    size_t total = B * M;
-    size_t block = 256;
-    size_t grid = (total + block - 1) / block;
+    const unsigned int block = 256;
+    const unsigned int gridM = (unsigned int)((M + block - 1) / block);
+    const unsigned int gridB = (unsigned int)B;
+    const dim3 grid(gridM, gridB);
+    const dim3 dimBlock(block);
     switch (dtype) {
     case LLAISYS_DTYPE_F32:
-        linear_kernel_f32<<<grid, block>>>((float*)out, (const float*)in, (const float*)weight, bias ? (const float*)bias : nullptr, B, M, K);
+        linear_kernel_f32<<<grid, dimBlock>>>((float*)out, (const float*)in, (const float*)weight, bias ? (const float*)bias : nullptr, B, M, K);
         break;
     case LLAISYS_DTYPE_BF16:
+        linear_kernel_bf16<<<grid, dimBlock>>>((uint16_t*)out, (const uint16_t*)in, (const uint16_t*)weight, bias ? (const uint16_t*)bias : nullptr, B, M, K);
+        break;
     case LLAISYS_DTYPE_F16:
-        linear_kernel_bf16<<<grid, block>>>((uint16_t*)out, (const uint16_t*)in, (const uint16_t*)weight, bias ? (const uint16_t*)bias : nullptr, B, M, K);
+        linear_kernel_f16<<<grid, dimBlock>>>((uint16_t*)out, (const uint16_t*)in, (const uint16_t*)weight, bias ? (const uint16_t*)bias : nullptr, B, M, K);
         break;
     default:
         break;
@@ -145,23 +173,33 @@ void linear(std::byte* out, const std::byte* in, const std::byte* weight, const 
 }
 
 // ---- Argmax (single output) ----
-__global__ void argmax_kernel_f32(int64_t* max_idx, float* max_val, const float* vals, size_t n) {
-    __shared__ float sh_max[256];
-    __shared__ size_t sh_idx[256];
-    size_t tid = threadIdx.x;
-    size_t i = blockIdx.x * blockDim.x + tid;
-    float my_val = (i < n) ? vals[i] : -1e38f;
-    size_t my_idx = i;
-    sh_max[tid] = my_val;
-    sh_idx[tid] = my_idx;
+// 单 block 内归约：只处理前 blockDim.x 个元素，供小 n 或第二段使用
+__device__ void argmax_block_reduce_f32(float* sh_max, size_t* sh_idx, size_t tid, size_t blockDim_x) {
     __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    for (int s = blockDim_x / 2; s > 0; s >>= 1) {
         if (tid < s && sh_max[tid] < sh_max[tid + s]) {
             sh_max[tid] = sh_max[tid + s];
             sh_idx[tid] = sh_idx[tid + s];
         }
         __syncthreads();
     }
+}
+
+__global__ void argmax_kernel_f32(int64_t* max_idx, float* max_val, const float* vals, size_t n) {
+    __shared__ float sh_max[256];
+    __shared__ size_t sh_idx[256];
+    size_t tid = threadIdx.x;
+    const size_t block = blockDim.x;
+    // 单 block 时必须覆盖全数组：每个线程循环处理 tid, tid+block, tid+2*block, ...
+    float my_val = -1e38f;
+    size_t my_idx = 0;
+    for (size_t i = tid; i < n; i += block) {
+        float v = vals[i];
+        if (v > my_val) { my_val = v; my_idx = i; }
+    }
+    sh_max[tid] = my_val;
+    sh_idx[tid] = my_idx;
+    argmax_block_reduce_f32(sh_max, sh_idx, tid, block);
     if (tid == 0) {
         *max_val = sh_max[0];
         *max_idx = (int64_t)sh_idx[0];
@@ -172,19 +210,16 @@ __global__ void argmax_kernel_bf16(int64_t* max_idx, uint16_t* max_val, const ui
     __shared__ float sh_max[256];
     __shared__ size_t sh_idx[256];
     size_t tid = threadIdx.x;
-    size_t i = blockIdx.x * blockDim.x + tid;
-    float my_val = (i < n) ? bf16_to_float(vals[i]) : -1e38f;
-    size_t my_idx = i;
+    const size_t block = blockDim.x;
+    float my_val = -1e38f;
+    size_t my_idx = 0;
+    for (size_t i = tid; i < n; i += block) {
+        float v = bf16_to_float(vals[i]);
+        if (v > my_val) { my_val = v; my_idx = i; }
+    }
     sh_max[tid] = my_val;
     sh_idx[tid] = my_idx;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s && sh_max[tid] < sh_max[tid + s]) {
-            sh_max[tid] = sh_max[tid + s];
-            sh_idx[tid] = sh_idx[tid + s];
-        }
-        __syncthreads();
-    }
+    argmax_block_reduce_f32(sh_max, sh_idx, tid, block);
     if (tid == 0) {
         *max_val = float_to_bf16(sh_max[0]);
         *max_idx = (int64_t)sh_idx[0];
@@ -193,9 +228,7 @@ __global__ void argmax_kernel_bf16(int64_t* max_idx, uint16_t* max_val, const ui
 
 void argmax(std::byte* max_idx, std::byte* max_val, const std::byte* vals, llaisysDataType_t dtype, size_t numel) {
     if (numel == 0) return;
-    size_t block = (numel < 256) ? 256 : 256;
-    size_t grid = (numel + block - 1) / block;
-    if (grid > 1) block = 256;
+    const size_t block = 256;
     switch (dtype) {
     case LLAISYS_DTYPE_F32:
         argmax_kernel_f32<<<1, block>>>((int64_t*)max_idx, (float*)max_val, (const float*)vals, numel);
@@ -346,6 +379,7 @@ void swiglu(std::byte* out, const std::byte* gate, const std::byte* up, llaisysD
 }
 
 // ---- Self-attention: causal, single head at a time for simplicity ----
+// shared: sh[0..kvlen-1] = scores, sh[kvlen..kvlen+blockDim.x-1] = per-thread max for reduction
 __global__ void self_attention_kernel_f32(float* attn_val, const float* q, const float* k, const float* v, float scale, size_t qlen, size_t kvlen, size_t nh, size_t nkvh, size_t hd) {
     int causal_off = (int)kvlen - (int)qlen;
     size_t i = blockIdx.x;
@@ -356,7 +390,8 @@ __global__ void self_attention_kernel_f32(float* attn_val, const float* q, const
     const float* k_base = k + kv_h * hd;
     const float* v_base = v + kv_h * hd;
 
-    extern __shared__ float sh_scores[];
+    extern __shared__ float sh[];
+    float* sh_scores = sh;
     float max_s = -1e30f;
     for (size_t j = threadIdx.x; j < kvlen; j += blockDim.x) {
         float dot = 0.f;
@@ -368,13 +403,17 @@ __global__ void self_attention_kernel_f32(float* attn_val, const float* q, const
         if (s > max_s) max_s = s;
     }
     __syncthreads();
+    sh_scores[kvlen + threadIdx.x] = max_s;
+    __syncthreads();
     for (int red = blockDim.x / 2; red > 0; red >>= 1) {
         if (threadIdx.x < red) {
-            size_t j = threadIdx.x + red;
-            if (j < kvlen && sh_scores[j] > max_s) max_s = sh_scores[j];
+            float other = sh_scores[kvlen + threadIdx.x + red];
+            if (other > sh_scores[kvlen + threadIdx.x]) sh_scores[kvlen + threadIdx.x] = other;
         }
         __syncthreads();
     }
+    max_s = sh_scores[kvlen];
+    __syncthreads();
     float sum_exp = 0.f;
     for (size_t j = threadIdx.x; j < kvlen; j += blockDim.x) {
         float e = expf(sh_scores[j] - max_s);
@@ -382,10 +421,14 @@ __global__ void self_attention_kernel_f32(float* attn_val, const float* q, const
         sum_exp += e;
     }
     __syncthreads();
+    sh_scores[kvlen + threadIdx.x] = sum_exp;
+    __syncthreads();
     for (int red = blockDim.x / 2; red > 0; red >>= 1) {
-        if (threadIdx.x < red) sum_exp += sh_scores[threadIdx.x + red];
+        if (threadIdx.x < red) sh_scores[kvlen + threadIdx.x] += sh_scores[kvlen + threadIdx.x + red];
         __syncthreads();
     }
+    sum_exp = sh_scores[kvlen];
+    __syncthreads();
     for (size_t j = threadIdx.x; j < kvlen; j += blockDim.x)
         sh_scores[j] /= sum_exp;
     __syncthreads();
@@ -409,7 +452,8 @@ __global__ void self_attention_kernel_bf16(uint16_t* attn_val, const uint16_t* q
     const uint16_t* k_base = k + kv_h * hd;
     const uint16_t* v_base = v + kv_h * hd;
 
-    extern __shared__ float sh_scores[];
+    extern __shared__ float sh[];
+    float* sh_scores = sh;
     float max_s = -1e30f;
     for (size_t j = threadIdx.x; j < kvlen; j += blockDim.x) {
         float dot = 0.f;
@@ -421,13 +465,17 @@ __global__ void self_attention_kernel_bf16(uint16_t* attn_val, const uint16_t* q
         if (s > max_s) max_s = s;
     }
     __syncthreads();
+    sh_scores[kvlen + threadIdx.x] = max_s;
+    __syncthreads();
     for (int red = blockDim.x / 2; red > 0; red >>= 1) {
         if (threadIdx.x < red) {
-            size_t j = threadIdx.x + red;
-            if (j < kvlen && sh_scores[j] > max_s) max_s = sh_scores[j];
+            float other = sh_scores[kvlen + threadIdx.x + red];
+            if (other > sh_scores[kvlen + threadIdx.x]) sh_scores[kvlen + threadIdx.x] = other;
         }
         __syncthreads();
     }
+    max_s = sh_scores[kvlen];
+    __syncthreads();
     float sum_exp = 0.f;
     for (size_t j = threadIdx.x; j < kvlen; j += blockDim.x) {
         float e = expf(sh_scores[j] - max_s);
@@ -435,10 +483,14 @@ __global__ void self_attention_kernel_bf16(uint16_t* attn_val, const uint16_t* q
         sum_exp += e;
     }
     __syncthreads();
+    sh_scores[kvlen + threadIdx.x] = sum_exp;
+    __syncthreads();
     for (int red = blockDim.x / 2; red > 0; red >>= 1) {
-        if (threadIdx.x < red) sum_exp += sh_scores[threadIdx.x + red];
+        if (threadIdx.x < red) sh_scores[kvlen + threadIdx.x] += sh_scores[kvlen + threadIdx.x + red];
         __syncthreads();
     }
+    sum_exp = sh_scores[kvlen];
+    __syncthreads();
     for (size_t j = threadIdx.x; j < kvlen; j += blockDim.x)
         sh_scores[j] /= sum_exp;
     __syncthreads();
@@ -455,7 +507,7 @@ __global__ void self_attention_kernel_bf16(uint16_t* attn_val, const uint16_t* q
 void self_attention(std::byte* out, const std::byte* q, const std::byte* k, const std::byte* v, llaisysDataType_t dtype, size_t qlen, size_t kvlen, size_t num_heads, size_t nkvh, size_t head_dim, float scale) {
     dim3 grid(qlen, num_heads);
     size_t block = 256;
-    size_t shmem = kvlen * sizeof(float);
+    size_t shmem = (kvlen + block) * sizeof(float);
     if (dtype == LLAISYS_DTYPE_F32)
         self_attention_kernel_f32<<<grid, block, shmem>>>((float*)out, (const float*)q, (const float*)k, (const float*)v, scale, qlen, kvlen, num_heads, nkvh, head_dim);
     else

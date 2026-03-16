@@ -9,6 +9,8 @@ from typing import Sequence
 import ctypes
 from ctypes import byref, cast, c_float, c_int, c_int64, c_size_t, c_ulonglong, POINTER
 
+# 张量并行时传 device_ids
+
 from ..libllaisys import LIB_LLAISYS
 from ..libllaisys import DeviceType
 from ..libllaisys import LlaisysQwen2Meta, LlaisysQwen2Weights, LlaisysQwen2Model_t
@@ -57,6 +59,111 @@ def _weight_key_to_handle(weights_ptr, nlayer: int):
         yield f"model.layers.{i}.mlp.down_proj.weight", w.mlp_down_w[i]
 
 
+def _shard_weight_for_tp(key: str, arr: np.ndarray, tp_rank: int, tp_world_size: int,
+                         nh: int, nkvh: int, dh: int, di: int, hs: int, nlayer: int):
+    """
+    张量并行：按 key 对权重做行/列切分，返回当前 rank 应加载的 shard。
+    列并行（输出维切分）：q/k/v_proj, gate/up_proj -> 切行。
+    行并行（输入维切分）：o_proj, down_proj -> 切列。
+    """
+    if tp_world_size <= 1:
+        return arr
+    w = tp_world_size
+    r = tp_rank
+    arr = np.ascontiguousarray(arr)
+    if "q_proj.weight" in key or "q_proj.bias" in key:
+        # [nh*dh, hs] or [nh*dh]
+        size = nh * dh
+        step = size // w
+        if "bias" in key:
+            return arr[r * step : (r + 1) * step].copy()
+        return arr[r * step : (r + 1) * step, :].copy()
+    if "k_proj.weight" in key or "k_proj.bias" in key or "v_proj.weight" in key or "v_proj.bias" in key:
+        size = nkvh * dh
+        step = size // w
+        if "bias" in key:
+            return arr[r * step : (r + 1) * step].copy()
+        return arr[r * step : (r + 1) * step, :].copy()
+    if "o_proj.weight" in key:
+        # [hs, nh*dh] 行并行
+        size = nh * dh
+        step = size // w
+        return arr[:, r * step : (r + 1) * step].copy()
+    if "gate_proj.weight" in key or "up_proj.weight" in key:
+        step = di // w
+        return arr[r * step : (r + 1) * step, :].copy()
+    if "down_proj.weight" in key:
+        step = di // w
+        return arr[:, r * step : (r + 1) * step].copy()
+    return arr
+
+
+def _bf16_bytes_to_float32(raw: bytes) -> np.ndarray:
+    """将 safetensors 中的 bf16 原始字节转为 float32 numpy（无 torch 依赖）。"""
+    n = len(raw) // 2
+    u16 = np.frombuffer(raw, dtype=np.uint16)
+    u32 = (u16.astype(np.uint32) << 16)
+    return np.frombuffer(u32.tobytes(), dtype=np.float32).copy()
+
+
+def _read_safetensors_header(fpath: Path):
+    """返回 (data_start_offset, key -> {dtype, shape, data_offsets})，便于无 torch 时读 bf16。"""
+    with open(fpath, "rb") as f:
+        header_len = int.from_bytes(f.read(8), "little")
+        header_json = f.read(header_len).decode("utf-8")
+        data_start = 8 + (header_len + 7) // 8 * 8
+    header = json.loads(header_json)
+    key_to_meta = {}
+    for k, v in header.items():
+        if k == "__metadata__":
+            continue
+        if isinstance(v, dict) and "dtype" in v and "shape" in v and "data_offsets" in v:
+            key_to_meta[k] = v
+    return data_start, key_to_meta
+
+
+def _load_bf16_weights_from_safetensors_no_torch(
+    fpath: Path,
+    key_to_handle: dict,
+    key_to_meta: dict,
+    data_start: int,
+    tp_world_size: int,
+    tp_rank: int,
+    num_attention_heads: int,
+    num_key_value_heads: int,
+    dh: int,
+    intermediate_size: int,
+    hidden_size: int,
+    num_hidden_layers: int,
+) -> set:
+    """从 safetensors 文件按 key 读 bf16 原始数据，转 float32 后灌入后端（不依赖 torch）。"""
+    loaded = set()
+    with open(fpath, "rb") as f:
+        for key, handle in key_to_handle.items():
+            if key not in key_to_meta:
+                continue
+            meta = key_to_meta[key]
+            if meta.get("dtype") != "BF16":
+                continue
+            shape = meta["shape"]
+            start, end = meta["data_offsets"]
+            offset_in_file = data_start + start
+            size_bytes = end - start
+            f.seek(offset_in_file)
+            raw = f.read(size_bytes)
+            arr = _bf16_bytes_to_float32(raw).reshape(shape)
+            arr = np.ascontiguousarray(arr)
+            if tp_world_size > 1:
+                arr = _shard_weight_for_tp(
+                    key, arr, tp_rank, tp_world_size,
+                    num_attention_heads, num_key_value_heads, dh,
+                    intermediate_size, hidden_size, num_hidden_layers,
+                )
+            _numpy_to_backend(arr, handle)
+            loaded.add(key)
+    return loaded
+
+
 def _numpy_to_backend(arr: np.ndarray, tensor_handle) -> None:
     """
     将 numpy 数组拷贝到 LLAISYS 后端张量（CPU 或设备内存）。
@@ -87,7 +194,14 @@ class Qwen2:
     做自回归生成。推理全程在 C++ 后端执行，Python 只做配置、权重加载和循环调用 Infer。
     """
 
-    def __init__(self, model_path, device: DeviceType = DeviceType.CPU, max_batch_size: int = 1):
+    def __init__(
+        self,
+        model_path,
+        device: DeviceType = DeviceType.CPU,
+        max_batch_size: int = 1,
+        tp_rank: int = 0,
+        tp_world_size: int = 1,
+    ):
         """
         从本地目录加载 Qwen2 模型：读 config、创建 C 模型、灌入权重。
 
@@ -95,6 +209,8 @@ class Qwen2:
             model_path: 模型目录路径（需含 config.json 和 *.safetensors）。
             device: 运行设备，如 DeviceType.CPU 或 DeviceType.NVIDIA。
             max_batch_size: KV-Cache 槽位数，用于连续批处理；1 为单序列（默认）。
+            tp_rank: 张量并行 rank（0..tp_world_size-1），默认 0。
+            tp_world_size: 张量并行 world size，1 表示非分布式，默认 1。
         """
         model_path = Path(model_path)
 
@@ -131,6 +247,7 @@ class Qwen2:
 
         # ---------- 2. 组装 C 侧元信息并创建模型 ----------
         # max_batch_size：连续批处理时 KV 槽位数，默认 1 保持单序列行为
+        # tp_rank / tp_world_size：张量并行（项目#5），默认 0/1 表示单卡
         meta = LlaisysQwen2Meta(
             dtype=dtype,
             nlayer=num_hidden_layers,
@@ -142,11 +259,14 @@ class Qwen2:
             maxseq=maxseq,
             voc=vocab_size,
             max_batch_size=max_batch_size,
+            tp_rank=tp_rank,
+            tp_world_size=tp_world_size,
             epsilon=rms_norm_eps,
             theta=rope_theta,
             end_token=eos_id,
         )
 
+        # TP 时每进程通常通过 CUDA_VISIBLE_DEVICES 只暴露一张卡，故传 device_ids=None 用默认 0 即可
         self._model = LIB_LLAISYS.llaisysQwen2ModelCreate(
             byref(meta),
             device,
@@ -165,16 +285,25 @@ class Qwen2:
         key_to_handle = dict(_weight_key_to_handle(weights_ptr, num_hidden_layers))
         loaded_keys = set()
 
-        # bfloat16 时 NumPy 无法直接读 safetensors，需用 PyTorch 打开再转 numpy
-        use_pt = (dtype == DataType.BF16) or (torch is not None)
-        if dtype == DataType.BF16 and torch is None:
-            raise RuntimeError("Loading bfloat16 weights requires PyTorch (pip install torch)")
+        # bfloat16 时可用 PyTorch 读；若无 torch（如 spawn 子进程避免 nccl 冲突）则走纯 Python 解析 safetensors
+        use_pt = torch is not None
+        use_bf16_no_torch = (dtype == DataType.BF16 and torch is None)
 
         safetensor_files = sorted(model_path.glob("*.safetensors"))
         for idx, fpath in enumerate(safetensor_files):
             if torch is not None and idx == 0:
                 pass  # 首次用 torch 打开文件时可能触发 c10 等，便于定位崩溃
             print(f"  Loading weights: {fpath.name} ({idx + 1}/{len(safetensor_files)})", flush=True)
+            if use_bf16_no_torch:
+                data_start, key_to_meta = _read_safetensors_header(fpath)
+                loaded = _load_bf16_weights_from_safetensors_no_torch(
+                    fpath, key_to_handle, key_to_meta, data_start,
+                    tp_world_size, tp_rank,
+                    num_attention_heads, num_key_value_heads, dh,
+                    intermediate_size, hidden_size, num_hidden_layers,
+                )
+                loaded_keys.update(loaded)
+                continue
             with safetensors.safe_open(
                 fpath, framework="pt" if use_pt else "numpy", device="cpu"
             ) as data:
@@ -191,6 +320,12 @@ class Qwen2:
                     else:
                         arr = np.ascontiguousarray(t)
                     arr = np.ascontiguousarray(arr)
+                    if tp_world_size > 1:
+                        arr = _shard_weight_for_tp(
+                            key, arr, tp_rank, tp_world_size,
+                            num_attention_heads, num_key_value_heads, dh,
+                            intermediate_size, hidden_size, num_hidden_layers,
+                        )
                     _numpy_to_backend(arr, handle)
                     loaded_keys.add(key)
 
@@ -208,6 +343,16 @@ class Qwen2:
                 "No embedding weights loaded. Loaded %d keys; sample keys from file: %s"
                 % (len(loaded_keys), sample_keys[:30])
             )
+
+        # GPU 时：默认只缓存输出层（推理主体在 GPU，快）；若环境变量 LLAISYS_GPU_FULL_CPU=1 则全量缓存，整次前向在 CPU（慢但可规避其它 GPU 算子问题）
+        if device == DeviceType.NVIDIA:
+            import os
+            if os.environ.get("LLAISYS_GPU_FULL_CPU") == "1":
+                LIB_LLAISYS.llaisysQwen2ModelCacheAllWeightsOnCPU(self._model)
+                print("  [Qwen2] GPU 已缓存全量权重到 CPU，推理全程在 CPU 上执行（LLAISYS_GPU_FULL_CPU=1）。", flush=True)
+            else:
+                LIB_LLAISYS.llaisysQwen2ModelCacheOutputLayerOnCPU(self._model)
+                print("  [Qwen2] GPU：embedding 与输出层在 CPU，其余层在 GPU。", flush=True)
 
     def kv_cache_bytes(self, prefix_len: int) -> int:
         """存储前缀长度为 prefix_len 的 KV cache 所需字节数。"""
@@ -410,6 +555,37 @@ class Qwen2:
         )
         if next_tok == -1:
             raise RuntimeError("llaisysQwen2ModelInfer failed (returned -1)")
+        return next_tok
+
+    def infer_hybrid(
+        self,
+        token_ids: Sequence[int],
+        temperature: float = 0.0,
+        top_k: int = 1,
+        top_p: float = 1.0,
+        seed: int = 0,
+        gpu_up_to_layer: int = -1,
+    ) -> int:
+        """
+        诊断用：前 (gpu_up_to_layer+1) 层在 GPU 上跑，其余在 CPU。需已调用 CacheAllWeightsOnCPU。
+        gpu_up_to_layer=-1：全 CPU；=0：仅 embedding 在 GPU；=1：embedding+layer0 在 GPU；依此类推。
+        调用前会 reset_kv_cache。
+        """
+        self.reset_kv_cache()
+        n = len(token_ids)
+        token_arr = (c_int64 * n)(*token_ids)
+        next_tok = LIB_LLAISYS.llaisysQwen2ModelInferHybrid(
+            self._model,
+            cast(token_arr, POINTER(c_int64)),
+            n,
+            c_float(temperature),
+            c_int(top_k),
+            c_float(top_p),
+            c_ulonglong(seed),
+            c_int(gpu_up_to_layer),
+        )
+        if next_tok == -1:
+            raise RuntimeError("llaisysQwen2ModelInferHybrid failed (returned -1)")
         return next_tok
 
     # ===== Python 的魔法方法：析构函数 =====

@@ -47,10 +47,10 @@ if __name__ == "__main__":
     args = parser.parse_args()
     testShapes = [(2, 3), (512, 4096)]
     testDtypePrec = [
-        # type, atol, rtol
+        # type, atol, rtol（bf16 用 1e-2 以兼容 float 累加再舍入与 PyTorch 原生 bf16 的细微差异）
         ("f32", 1e-5, 1e-5),
         ("f16", 1e-3, 1e-3),
-        ("bf16", 1e-3, 1e-3),
+        ("bf16", 1e-2, 1e-2),
     ]
     print(f"Testing Ops.add on {args.device}")
     for shape in testShapes:

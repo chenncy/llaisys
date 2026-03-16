@@ -8,6 +8,8 @@ LLAISYS_EXTERN_C {
         llaisysDataType_t dtype;
         size_t nlayer, hs, nh, nkvh, dh, di, maxseq, voc;
         size_t max_batch_size;  /* 连续批处理：KV-Cache 槽位数，1=单序列（默认） */
+        int tp_rank;            /* 张量并行 rank，0..tp_world_size-1；默认 0 */
+        int tp_world_size;      /* 张量并行 world size，1=非分布式；默认 1 */
         float epsilon, theta;
         int64_t end_token;
     };
@@ -35,6 +37,12 @@ LLAISYS_EXTERN_C {
     __export struct LlaisysQwen2Model *llaisysQwen2ModelCreate(const LlaisysQwen2Meta *meta, llaisysDeviceType_t device, int *device_ids, int ndevice);
 
     __export void llaisysQwen2ModelDestroy(struct LlaisysQwen2Model * model);
+
+    /** 将输出层权重（out_norm_w、out_embed）拷到 CPU 并缓存；GPU 推理时最后一层在 CPU 上算以规避 GPU 输出层异常。应在权重加载完成后调用一次。 */
+    __export void llaisysQwen2ModelCacheOutputLayerOnCPU(struct LlaisysQwen2Model * model);
+
+    /** 将所有权重与 KV cache 拷到 CPU 并缓存；GPU 推理时整次前向在 CPU 上执行以规避 GPU 算子异常。应在权重加载完成后调用一次。 */
+    __export void llaisysQwen2ModelCacheAllWeightsOnCPU(struct LlaisysQwen2Model * model);
 
     __export struct LlaisysQwen2Weights *llaisysQwen2ModelWeights(struct LlaisysQwen2Model * model);
 
@@ -73,6 +81,13 @@ LLAISYS_EXTERN_C {
     __export int64_t llaisysQwen2ModelInferWithSlot(struct LlaisysQwen2Model * model, size_t slot_id, int64_t * token_ids, size_t ntoken, float temperature, int top_k, float top_p, unsigned long long seed);
 
     __export int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model * model, int64_t * token_ids, size_t ntoken, float temperature, int top_k, float top_p, unsigned long long seed);
+
+    /**
+     * 诊断用：前 (gpu_up_to_layer+1) 层在 GPU 上跑，其余层与输出在 CPU 上跑；需已调用 CacheAllWeightsOnCPU。
+     * gpu_up_to_layer < 0：整次前向在 CPU；=0：仅 embedding 在 GPU；=1：embedding+layer0 在 GPU；依此类推。
+     * 返回 next_token。用于逐层对比找出首个产生错误结果的 GPU 层。
+     */
+    __export int64_t llaisysQwen2ModelInferHybrid(struct LlaisysQwen2Model * model, int64_t * token_ids, size_t ntoken, float temperature, int top_k, float top_p, unsigned long long seed, int gpu_up_to_layer);
 
     /**
      * 批量 Decode：一次传入多 slot 的当前 token，返回多个 next token。

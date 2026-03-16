@@ -25,6 +25,8 @@ class LlaisysQwen2Meta(Structure):
         ("maxseq", c_size_t),
         ("voc", c_size_t),
         ("max_batch_size", c_size_t),  # 连续批处理槽位数，1=单序列
+        ("tp_rank", c_int),            # 张量并行 rank，默认 0
+        ("tp_world_size", c_int),      # 张量并行 world size，1=非分布式
         ("epsilon", c_float),
         ("theta", c_float),
         ("end_token", c_int64),
@@ -65,6 +67,12 @@ def load_qwen2(lib):
 
     lib.llaisysQwen2ModelDestroy.argtypes = [LlaisysQwen2Model_t]
     lib.llaisysQwen2ModelDestroy.restype = None
+
+    lib.llaisysQwen2ModelCacheOutputLayerOnCPU.argtypes = [LlaisysQwen2Model_t]
+    lib.llaisysQwen2ModelCacheOutputLayerOnCPU.restype = None
+
+    lib.llaisysQwen2ModelCacheAllWeightsOnCPU.argtypes = [LlaisysQwen2Model_t]
+    lib.llaisysQwen2ModelCacheAllWeightsOnCPU.restype = None
 
     lib.llaisysQwen2ModelWeights.argtypes = [LlaisysQwen2Model_t]
     lib.llaisysQwen2ModelWeights.restype = POINTER(LlaisysQwen2Weights)
@@ -127,6 +135,18 @@ def load_qwen2(lib):
         c_ulonglong,  # seed
     ]
     lib.llaisysQwen2ModelInfer.restype = c_int64
+
+    lib.llaisysQwen2ModelInferHybrid.argtypes = [
+        LlaisysQwen2Model_t,
+        POINTER(c_int64),
+        c_size_t,
+        c_float,
+        c_int,
+        c_float,
+        c_ulonglong,
+        c_int,        # gpu_up_to_layer: -1=all CPU, 0=only embed GPU, 1=embed+layer0 GPU, ...
+    ]
+    lib.llaisysQwen2ModelInferHybrid.restype = c_int64
 
     lib.llaisysQwen2ModelBatchedDecode.argtypes = [
         LlaisysQwen2Model_t,
