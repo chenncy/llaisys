@@ -343,6 +343,9 @@ size_t llaisysQwen2ModelGetKVCacheBytes(struct LlaisysQwen2Model *model, size_t 
     return nlayer * 2 * prefix_len * nkvh * dh * elem_size;
 }
 
+} // extern "C"
+
+// 内部辅助函数：使用 C++  linkage，避免 MSVC C4190（C-linkage 返回 C++ 类型）
 static tensor_t get_slot_k_cache(LlaisysQwen2Model *model, size_t layer_idx, size_t slot_id) {
     const size_t maxseq = model->meta.maxseq, nkvh = model->meta.nkvh, dh = model->meta.dh;
     tensor_t raw = model->k_caches[layer_idx];
@@ -357,6 +360,8 @@ static tensor_t get_slot_v_cache(LlaisysQwen2Model *model, size_t layer_idx, siz
         return raw->slice(0, slot_id, slot_id + 1)->view({maxseq, nkvh, dh});
     return raw;
 }
+
+LLAISYS_EXTERN_C {
 
 void llaisysQwen2ModelExportKVCache(struct LlaisysQwen2Model *model, void *ptr_out) {
     if (!model || !ptr_out || model->cache_lens.empty()) return;

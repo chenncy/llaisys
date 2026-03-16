@@ -94,11 +94,15 @@ target("llaisys-ops")
     if not is_plat("windows") then
         add_cxflags("-Wno-unknown-pragmas")
     end
-    -- OpenMP：linear 等算子多线程并行，提升 CPU 推理速度
-    add_cxflags("-fopenmp")
-    add_mxflags("-fopenmp")
-    add_ldflags("-fopenmp")
-    
+    -- OpenMP：linear 等算子多线程并行，提升 CPU 推理速度（Windows 用 MSVC /openmp，否则 GCC -fopenmp）
+    if is_plat("windows") then
+        add_cxflags("/openmp")
+    else
+        add_cxflags("-fopenmp")
+        add_mxflags("-fopenmp")
+        add_ldflags("-fopenmp")
+    end
+
     -- AVX2+FMА：FP32 linear 使用 SIMD（仅 x86_64）
     if is_arch("x86_64") then
         add_cxflags("-mavx2", "-mfma")
@@ -121,8 +125,14 @@ target("llaisys")
     set_warnings("all")
     add_includedirs("src")
     add_files("src/llaisys/*.cc")
-    add_ldflags("-fopenmp")
-    add_links("gomp")
+    -- OpenMP：Windows 用 MSVC /openmp（无需 gomp.lib），Linux/macOS 用 -fopenmp + gomp
+    if is_plat("windows") then
+        add_cxflags("/openmp")
+        add_ldflags("/openmp")
+    else
+        add_ldflags("-fopenmp")
+        add_links("gomp")
+    end
     if has_config("nv-gpu") then
         add_links("cudart")
         add_ldflags("-fPIC")
