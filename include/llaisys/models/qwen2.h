@@ -56,6 +56,12 @@ LLAISYS_EXTERN_C {
     /** 将指定 slot 的 cache_len 置 0；仅当 meta.max_batch_size > 1 时有效 */
     __export void llaisysQwen2ModelResetKVCacheSlot(struct LlaisysQwen2Model * model, size_t slot_id);
 
+    /** 将指定 slot 的 KV cache 导出到 ptr_out（调用方需分配 GetKVCacheBytes(model, GetCacheLenSlot(model, slot_id)) 字节） */
+    __export void llaisysQwen2ModelExportKVCacheSlot(struct LlaisysQwen2Model * model, size_t slot_id, void * ptr_out);
+
+    /** 从 ptr_in 导入前缀长度为 prefix_len 的 KV 到指定 slot，并设该 slot 的 cache_len = prefix_len；之后可做 suffix prefill */
+    __export void llaisysQwen2ModelImportKVCacheSlot(struct LlaisysQwen2Model * model, size_t slot_id, const void * ptr_in, size_t prefix_len);
+
     /** 返回指定 slot 的 cache_len；当 max_batch_size==1 时 slot_id 忽略，返回当前唯一 cache_len */
     __export size_t llaisysQwen2ModelGetCacheLenSlot(struct LlaisysQwen2Model * model, size_t slot_id);
 

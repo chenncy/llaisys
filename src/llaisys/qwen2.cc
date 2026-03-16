@@ -421,6 +421,53 @@ void llaisysQwen2ModelResetKVCacheSlot(struct LlaisysQwen2Model *model, size_t s
         model->cache_lens[slot_id] = 0;
 }
 
+void llaisysQwen2ModelExportKVCacheSlot(struct LlaisysQwen2Model *model, size_t slot_id, void *ptr_out) {
+    if (!model || !ptr_out || model->cache_lens.empty()) return;
+    if (slot_id >= model->cache_lens.size()) return;
+    const size_t cache_len = model->cache_lens[slot_id];
+    if (cache_len == 0) return;
+    const LlaisysQwen2Meta *meta = &model->meta;
+    const size_t nlayer = meta->nlayer;
+    const size_t nkvh = meta->nkvh;
+    const size_t dh = meta->dh;
+    const size_t elem_size = llaisys::utils::dsize(meta->dtype);
+    const size_t row_bytes = nkvh * dh * elem_size;
+    const size_t layer_bytes = cache_len * row_bytes;
+    std::byte *out = static_cast<std::byte *>(ptr_out);
+    llaisys::core::context().setDevice(model->device_type, model->device_id);
+    for (size_t i = 0; i < nlayer; i++) {
+        tensor_t k_slot = get_slot_k_cache(model, i, slot_id);
+        tensor_t v_slot = get_slot_v_cache(model, i, slot_id);
+        copy_device_to_host(out, k_slot->data(), layer_bytes, model->device_type);
+        out += layer_bytes;
+        copy_device_to_host(out, v_slot->data(), layer_bytes, model->device_type);
+        out += layer_bytes;
+    }
+}
+
+void llaisysQwen2ModelImportKVCacheSlot(struct LlaisysQwen2Model *model, size_t slot_id, const void *ptr_in, size_t prefix_len) {
+    if (!model || !ptr_in || prefix_len == 0 || model->cache_lens.empty()) return;
+    if (slot_id >= model->cache_lens.size()) return;
+    const LlaisysQwen2Meta *meta = &model->meta;
+    const size_t nlayer = meta->nlayer;
+    const size_t nkvh = meta->nkvh;
+    const size_t dh = meta->dh;
+    const size_t elem_size = llaisys::utils::dsize(meta->dtype);
+    const size_t row_bytes = nkvh * dh * elem_size;
+    const size_t layer_bytes = prefix_len * row_bytes;
+    const std::byte *in = static_cast<const std::byte *>(ptr_in);
+    llaisys::core::context().setDevice(model->device_type, model->device_id);
+    for (size_t i = 0; i < nlayer; i++) {
+        tensor_t k_slot = get_slot_k_cache(model, i, slot_id);
+        tensor_t v_slot = get_slot_v_cache(model, i, slot_id);
+        copy_host_to_device(k_slot->data(), in, layer_bytes, model->device_type);
+        in += layer_bytes;
+        copy_host_to_device(v_slot->data(), in, layer_bytes, model->device_type);
+        in += layer_bytes;
+    }
+    model->cache_lens[slot_id] = prefix_len;
+}
+
 /**
  * 单步推理：根据当前 token 序列做一次前向，返回下一个 token 的 id。
  * - 若 cache_len==0（prefill）：传入整段 token_ids，seq_len=ntoken，并填充 KV cache；

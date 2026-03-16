@@ -2,6 +2,7 @@
 #ifdef __AVX2__
 #include <immintrin.h>
 #endif
+#include <cstddef>
 
 #include "op.hpp"
 
@@ -24,10 +25,11 @@ namespace {
 template <typename T>
 void linear_impl(T *out, const T *in, const T *weight, const T *bias, size_t B, size_t M, size_t K) {
     // 外层循环：遍历输入张量的批次大小或序列长度维度 B。
+    // MSVC OpenMP 要求 index 为 signed integral type，故用 ptrdiff_t。
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-    for (size_t i = 0; i < B; i++) {
+    for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(B); i++) {
         // 中层循环：遍历输出特征维度 M。
         for (size_t j = 0; j < M; j++) {
             
@@ -123,7 +125,7 @@ static void linear_f32_avx2(float *out, const float *in, const float *weight, co
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-    for (size_t i = 0; i < B; i++) {
+    for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(B); i++) {
         const float *in_row = in + i * K;
         for (size_t j = 0; j < M; j++) {
             const float *w_row = weight + j * K;

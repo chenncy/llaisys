@@ -240,6 +240,36 @@ class Qwen2:
             self._model, ctypes.cast(buf, ctypes.c_void_p), prefix_len
         )
 
+    def export_kv_cache_slot(self, slot_id: int) -> bytes:
+        """导出指定 slot 的 KV cache 到字节串（用于连续批处理 + KV 池）。"""
+        n = LIB_LLAISYS.llaisysQwen2ModelGetCacheLenSlot(self._model, slot_id)
+        if n == 0:
+            return b""
+        size = LIB_LLAISYS.llaisysQwen2ModelGetKVCacheBytes(self._model, n)
+        buf = (ctypes.c_byte * size)()
+        LIB_LLAISYS.llaisysQwen2ModelExportKVCacheSlot(
+            self._model, slot_id, ctypes.cast(buf, ctypes.c_void_p)
+        )
+        return bytes(buf)
+
+    def import_kv_cache_slot(self, slot_id: int, data: bytes, prefix_len: int) -> None:
+        """将字节串导入到指定 slot 的前缀 KV cache；之后可对该 slot 做 suffix prefill。"""
+        if prefix_len == 0 or not data:
+            return
+        expected = self.kv_cache_bytes(prefix_len)
+        if len(data) < expected:
+            raise ValueError(
+                f"import_kv_cache_slot: need {expected} bytes, got {len(data)}"
+            )
+        buf = (ctypes.c_byte * len(data))()
+        ctypes.memmove(ctypes.addressof(buf), data, len(data))
+        LIB_LLAISYS.llaisysQwen2ModelImportKVCacheSlot(
+            self._model,
+            slot_id,
+            ctypes.cast(buf, ctypes.c_void_p),
+            prefix_len,
+        )
+
     @property
     def cache_len(self) -> int:
         """当前已写入 KV cache 的长度。"""

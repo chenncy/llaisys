@@ -91,6 +91,17 @@ def load_qwen2(lib):
     lib.llaisysQwen2ModelResetKVCacheSlot.argtypes = [LlaisysQwen2Model_t, c_size_t]
     lib.llaisysQwen2ModelResetKVCacheSlot.restype = None
 
+    lib.llaisysQwen2ModelExportKVCacheSlot.argtypes = [LlaisysQwen2Model_t, c_size_t, c_void_p]
+    lib.llaisysQwen2ModelExportKVCacheSlot.restype = None
+
+    lib.llaisysQwen2ModelImportKVCacheSlot.argtypes = [
+        LlaisysQwen2Model_t,
+        c_size_t,
+        c_void_p,
+        c_size_t,
+    ]
+    lib.llaisysQwen2ModelImportKVCacheSlot.restype = None
+
     lib.llaisysQwen2ModelGetCacheLenSlot.argtypes = [LlaisysQwen2Model_t, c_size_t]
     lib.llaisysQwen2ModelGetCacheLenSlot.restype = c_size_t
 

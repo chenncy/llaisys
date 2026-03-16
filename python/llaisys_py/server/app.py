@@ -1033,6 +1033,23 @@ def _kv_pool_put(session_id: str, user_message_index: int, blob: bytes, prefix_l
         _kv_pool[key] = {"blob": blob, "prefix_len": prefix_len, "last_used": _time_module.perf_counter()}
 
 
+def resolve_kv_prefix(session_id: Optional[str], request_messages: list, tokenizer, input_ids: list) -> tuple[int, Optional[bytes]]:
+    """若 session 且可命中 KV 池则返回 (prefix_len, blob)；否则返回 (0, None)。供 Engine 与 worker 共用。"""
+    if not session_id or not request_messages or tokenizer is None:
+        return (0, None)
+    user_count = _count_user_messages(request_messages)
+    if user_count == 0:
+        return (0, None)
+    hit = _kv_pool_get(session_id, user_count - 1)
+    if hit is None:
+        return (0, None)
+    blob, stored_prefix_len = hit
+    need_prefix_len = _prefix_len_for_messages(request_messages, tokenizer)
+    if stored_prefix_len != need_prefix_len or need_prefix_len <= 0 or need_prefix_len >= len(input_ids):
+        return (0, None)
+    return (stored_prefix_len, blob)
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -1214,7 +1231,17 @@ def create_app(model_path: Optional[str] = None, device: str = "cpu"):
     _engine = None
     if use_engine and max_batch_size >= 1:
         from .engine import Engine
-        _engine = Engine(_model, max_batch_size, pending_maxsize=_REQUEST_QUEUE_MAX)
+        def _engine_get_kv(session_id, request_messages, input_ids):
+            return resolve_kv_prefix(session_id, request_messages, _tokenizer, input_ids)
+        def _engine_put_kv(session_id, request_messages, blob, prefix_len):
+            _kv_pool_put(session_id, _count_user_messages(request_messages), blob, prefix_len)
+        _engine = Engine(
+            _model,
+            max_batch_size,
+            pending_maxsize=_REQUEST_QUEUE_MAX,
+            get_kv=_engine_get_kv,
+            put_kv=_engine_put_kv,
+        )
 
     app = FastAPI(title="LLAISYS Chatbot", description="OpenAI chat-completion style API")
     _register_routes(app)
@@ -1241,6 +1268,19 @@ def _register_routes(app: FastAPI):
     def health():
         """健康检查：是否存活及模型是否已加载。"""
         return {"status": "ok", "model_loaded": _model is not None}
+
+    @app.get("/v1/metrics")
+    def metrics():
+        """项目#4 监控指标（4.5.3）：队列长度、Engine 状态、KV 池大小等。"""
+        out = {
+            "request_queue_size": _request_queue.qsize(),
+            "request_queue_max": _REQUEST_QUEUE_MAX,
+            "kv_pool_size": len(_kv_pool),
+            "kv_pool_max": _KV_POOL_MAX_ENTRIES,
+        }
+        if _engine is not None:
+            out["engine"] = _engine.get_metrics()
+        return out
 
     @app.get("/chat", response_class=HTMLResponse)
     def chat_page():
@@ -1445,19 +1485,7 @@ def _register_routes(app: FastAPI):
 
     def _resolve_kv_prefix(session_id: Optional[str], request_messages: list[ChatMessage], tokenizer, input_ids: list[int]):
         """若 session 且可命中池则返回 (prefix_len, blob)；否则返回 (0, None)。"""
-        if not session_id or not request_messages:
-            return (0, None)
-        user_count = _count_user_messages(request_messages)
-        if user_count == 0:
-            return (0, None)
-        hit = _kv_pool_get(session_id, user_count - 1)
-        if hit is None:
-            return (0, None)
-        blob, stored_prefix_len = hit
-        need_prefix_len = _prefix_len_for_messages(request_messages, tokenizer)
-        if stored_prefix_len != need_prefix_len or need_prefix_len <= 0 or need_prefix_len >= len(input_ids):
-            return (0, None)
-        return (stored_prefix_len, blob)
+        return resolve_kv_prefix(session_id, request_messages, tokenizer, input_ids)
 
     def _worker_loop():
         """项目#4：单 worker 线程，从请求队列取任务并执行推理，结果放入各请求的 response_queue。"""
